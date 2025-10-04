@@ -44,47 +44,59 @@ setup_logger(logger)
 
 
 def generate_question_vectors(
-    question_encoder: torch.nn.Module,
-    tensorizer: Tensorizer,
-    questions: List[str],
-    bsz: int,
-    query_token: str = None,
-    selector: RepTokenSelector = None,
+    question_encoder: torch.nn.Module,  # 问题编码器，将问题文本编码为向量
+    tensorizer: Tensorizer,  # 文本张量化工具，负责文本预处理和转换
+    questions: List[str],  # 待编码的问题列表
+    bsz: int,  # 批处理大小
+    query_token: str = None,  # 特殊查询token（可选）
+    selector: RepTokenSelector = None,  # 表示token选择器（可选）
 ) -> T:
     n = len(questions)
-    query_vectors = []
+    query_vectors = []  # 存储编码后的问题向量
 
-    with torch.no_grad():
+    with torch.no_grad():  # 推理模式，不计算梯度
+        # 按批次处理问题，提高效率
         for j, batch_start in enumerate(range(0, n, bsz)):
             batch_questions = questions[batch_start : batch_start + bsz]
 
+            # 根据不同情况处理问题文本
             if query_token:
+                # 如果有特殊查询token，需要特殊处理
                 # TODO: tmp workaround for EL, remove or revise
                 if query_token == "[START_ENT]":
+                    # 实体链接的特殊处理
                     batch_tensors = [
                         _select_span_with_token(q, tensorizer, token_str=query_token) for q in batch_questions
                     ]
                 else:
+                    # 在问题前添加特殊token
                     batch_tensors = [tensorizer.text_to_tensor(" ".join([query_token, q])) for q in batch_questions]
             elif isinstance(batch_questions[0], T):
+                # 如果已经是张量，直接使用
                 batch_tensors = [q for q in batch_questions]
             else:
+                # 普通文本转张量
                 batch_tensors = [tensorizer.text_to_tensor(q) for q in batch_questions]
 
+            # 处理变长序列：填充到统一长度
             # TODO: this only works for Wav2vec pipeline but will crash the regular text pipeline
             max_vector_len = max(q_t.size(1) for q_t in batch_tensors)
             min_vector_len = min(q_t.size(1) for q_t in batch_tensors)
 
             if max_vector_len != min_vector_len:
+                # 如果长度不一致，填充到最大长度
                 # TODO: _pad_to_len move to utils
                 from dpr.models.reader import _pad_to_len
                 batch_tensors = [_pad_to_len(q.squeeze(0), 0, max_vector_len) for q in batch_tensors]
 
-            q_ids_batch = torch.stack(batch_tensors, dim=0).cuda()
-            q_seg_batch = torch.zeros_like(q_ids_batch).cuda()
-            q_attn_mask = tensorizer.get_attn_mask(q_ids_batch)
+            # 准备模型输入
+            q_ids_batch = torch.stack(batch_tensors, dim=0).cuda()  # 问题token ids
+            q_seg_batch = torch.zeros_like(q_ids_batch).cuda()  # segment ids（BERT需要）
+            q_attn_mask = tensorizer.get_attn_mask(q_ids_batch)  # 注意力掩码
 
+            # 通过编码器获取问题的向量表示
             if selector:
+                # 如果有自定义的表示token选择器
                 rep_positions = selector.get_positions(q_ids_batch, tensorizer)
 
                 _, out, _ = BiEncoder.get_representation(
@@ -95,6 +107,7 @@ def generate_question_vectors(
                     representation_token_pos=rep_positions,
                 )
             else:
+                # 使用默认的编码方式（通常是CLS token）
                 _, out, _ = question_encoder(q_ids_batch, q_seg_batch, q_attn_mask)
 
             query_vectors.extend(out.cpu().split(1, dim=0))
@@ -109,11 +122,15 @@ def generate_question_vectors(
 
 
 class DenseRetriever(object):
+    """
+    DPR检索器基类：负责将问题编码为密集向量
+    这是RAG系统中的核心组件，实现了问题到向量的转换
+    """
     def __init__(self, question_encoder: nn.Module, batch_size: int, tensorizer: Tensorizer):
-        self.question_encoder = question_encoder
-        self.batch_size = batch_size
-        self.tensorizer = tensorizer
-        self.selector = None
+        self.question_encoder = question_encoder  # 问题编码器（通常是BERT）
+        self.batch_size = batch_size  # 批处理大小
+        self.tensorizer = tensorizer  # 文本预处理工具
+        self.selector = None  # 可选的token选择器
 
     def generate_question_vectors(self, questions: List[str], query_token: str = None) -> T:
 
@@ -131,7 +148,14 @@ class DenseRetriever(object):
 
 class LocalFaissRetriever(DenseRetriever):
     """
-    Does passage retrieving over the provided index and question encoder
+    本地FAISS检索器：DPR的完整实现
+    
+    功能：
+    1. 将问题编码为密集向量
+    2. 在FAISS索引中搜索最相似的段落
+    3. 返回top-k检索结果
+    
+    这是RAG系统中的检索组件，负责从大规模文档库中找到相关段落
     """
 
     def __init__(
@@ -146,14 +170,17 @@ class LocalFaissRetriever(DenseRetriever):
 
     def index_encoded_data(
         self,
-        vector_files: List[str],
-        buffer_size: int,
-        path_id_prefixes: List = None,
+        vector_files: List[str],  # 预编码的段落向量文件列表
+        buffer_size: int,  # 缓冲区大小
+        path_id_prefixes: List = None,  # 路径ID前缀
     ):
         """
-        Indexes encoded passages takes form a list of files
-        :param vector_files: file names to get passages vectors from
-        :param buffer_size: size of a buffer (amount of passages) to send for the indexing at once
+        构建FAISS索引：这是RAG系统的离线预处理步骤
+        
+        将预编码的段落向量加载到FAISS索引中，支持快速相似度搜索
+        
+        :param vector_files: 段落向量文件名列表
+        :param buffer_size: 批量索引的缓冲区大小
         :return:
         """
         buffer = []
@@ -167,10 +194,14 @@ class LocalFaissRetriever(DenseRetriever):
 
     def get_top_docs(self, query_vectors: np.array, top_docs: int = 100) -> List[Tuple[List[object], List[float]]]:
         """
-        Does the retrieval of the best matching passages given the query vectors batch
-        :param query_vectors:
-        :param top_docs:
-        :return:
+        RAG检索的核心步骤：在向量空间中搜索最相似的段落
+        
+        通过FAISS索引快速找到与查询向量最相似的top-k段落
+        这是RAG系统实时推理的关键步骤
+        
+        :param query_vectors: 查询向量矩阵
+        :param top_docs: 返回的top-k文档数量
+        :return: 每个查询对应的(文档ID列表, 相似度分数列表)
         """
         time0 = time.time()
         results = self.index.search_knn(query_vectors, top_docs)
@@ -181,6 +212,12 @@ class LocalFaissRetriever(DenseRetriever):
 
 # works only with our distributed_faiss library
 class DenseRPCRetriever(DenseRetriever):
+    """
+    分布式RPC检索器：用于大规模部署的DPR实现
+    
+    支持分布式FAISS索引，可以处理超大规模的文档库
+    适用于生产环境中的RAG系统部署
+    """
     def __init__(
         self,
         question_encoder: nn.Module,
@@ -299,15 +336,17 @@ class DenseRPCRetriever(DenseRetriever):
 
 
 def validate(
-    passages: Dict[object, Tuple[str, str]],
-    answers: List[List[str]],
-    result_ctx_ids: List[Tuple[List[object], List[float]]],
-    workers_num: int,
-    match_type: str,
+    passages: Dict[object, Tuple[str, str]],  # 段落ID到(文本,标题)的映射
+    answers: List[List[str]],  # 每个问题的答案列表
+    result_ctx_ids: List[Tuple[List[object], List[float]]],  # 检索结果
+    workers_num: int,  # 并行工作线程数
+    match_type: str,  # 匹配类型（字符串或正则）
 ) -> List[List[bool]]:
+    """RAG系统性能评估：验证检索到的段落是否包含正确答案"""
     logger.info("validating passages. size=%d", len(passages))
+    # 计算检索结果中有多少包含正确答案
     match_stats = calculate_matches(passages, answers, result_ctx_ids, workers_num, match_type)
-    top_k_hits = match_stats.top_k_hits
+    top_k_hits = match_stats.top_k_hits  # top-k命中统计
 
     logger.info("Validation results: top k documents hits %s", top_k_hits)
     top_k_hits = [v / len(result_ctx_ids) for v in top_k_hits]
@@ -471,26 +510,41 @@ def get_all_passages(ctx_sources):
 
 @hydra.main(config_path="conf", config_name="dense_retriever")
 def main(cfg: DictConfig):
-    cfg = setup_cfg_gpu(cfg)
-    saved_state = load_states_from_checkpoint(cfg.model_file)
+    """
+    DPR检索系统主函数：完整的RAG检索流程
+    
+    流程：
+    1. 加载预训练的双编码器模型
+    2. 初始化问题编码器和FAISS索引
+    3. 将问题编码为向量
+    4. 在索引中搜索相关段落
+    5. 评估检索性能
+    6. 保存结果
+    """
+    # 1. 系统初始化
+    cfg = setup_cfg_gpu(cfg)  # 配置GPU
+    saved_state = load_states_from_checkpoint(cfg.model_file)  # 加载预训练模型
 
-    set_cfg_params_from_state(saved_state.encoder_params, cfg)
+    set_cfg_params_from_state(saved_state.encoder_params, cfg)  # 设置编码器参数
 
     logger.info("CFG (after gpu  configuration):")
     logger.info("%s", OmegaConf.to_yaml(cfg))
 
+    # 2. 初始化双编码器组件（DPR的核心）
     tensorizer, encoder, _ = init_biencoder_components(cfg.encoder.encoder_model_type, cfg, inference_only=True)
 
+    # 3. 加载训练好的模型权重
     logger.info("Loading saved model state ...")
     encoder.load_state(saved_state, strict=False)
 
+    # 4. 选择编码器（问题编码器或段落编码器）
     encoder_path = cfg.encoder_path
     if encoder_path:
         logger.info("Selecting encoder: %s", encoder_path)
         encoder = getattr(encoder, encoder_path)
     else:
         logger.info("Selecting standard question encoder")
-        encoder = encoder.question_model
+        encoder = encoder.question_model  # 默认使用问题编码器
 
     encoder, _ = setup_for_distributed_mode(encoder, None, cfg.device, cfg.n_gpu, cfg.local_rank, cfg.fp16)
     encoder.eval()
@@ -499,10 +553,10 @@ def main(cfg: DictConfig):
     vector_size = model_to_load.get_out_size()
     logger.info("Encoder vector_size=%d", vector_size)
 
-    # get questions & answers
-    questions = []
-    questions_text = []
-    question_answers = []
+    # 5. 加载评估数据集
+    questions = []  # 问题列表
+    questions_text = []  # 问题文本（用于显示）
+    question_answers = []  # 标准答案
 
     if not cfg.qa_dataset:
         logger.warning("Please specify qa_dataset to use")
@@ -524,7 +578,9 @@ def main(cfg: DictConfig):
     logger.info("questions len %d", len(questions))
     logger.info("questions_text len %d", len(questions_text))
 
+    # 6. 初始化检索器（本地FAISS或分布式RPC）
     if cfg.rpc_retriever_cfg_file:
+        # 分布式检索器：适用于大规模部署
         index_buffer_sz = 1000
         retriever = DenseRPCRetriever(
             encoder,
@@ -535,12 +591,14 @@ def main(cfg: DictConfig):
             use_l2_conversion=cfg.use_l2_conversion,
         )
     else:
+        # 本地FAISS检索器：适用于单机部署
         index = hydra.utils.instantiate(cfg.indexers[cfg.indexer])
         logger.info("Local Index class %s ", type(index))
         index_buffer_sz = index.buffer_size
         index.init_index(vector_size)
         retriever = LocalFaissRetriever(encoder, cfg.batch_size, tensorizer, index)
 
+    # 7. 将问题编码为密集向量（RAG的关键步骤）
     logger.info("Using special token %s", qa_src.special_query_token)
     questions_tensor = retriever.generate_question_vectors(questions, query_token=qa_src.special_query_token)
 
@@ -592,10 +650,12 @@ def main(cfg: DictConfig):
         if index_path:
             retriever.index.serialize(index_path)
 
-    # get top k results
+    # 8. 执行检索：在向量空间中搜索最相关的段落
     top_results_and_scores = retriever.get_top_docs(questions_tensor.numpy(), cfg.n_docs)
 
+    # 9. 评估检索性能：验证RAG系统的效果
     if cfg.use_rpc_meta:
+        # 使用RPC元数据进行验证
         questions_doc_hits = validate_from_meta(
             question_answers,
             top_results_and_scores,
@@ -613,9 +673,10 @@ def main(cfg: DictConfig):
                 cfg.rpc_meta_compressed,
             )
     else:
+        # 使用本地段落数据进行验证
         all_passages = get_all_passages(ctx_sources)
         if cfg.validate_as_tables:
-
+            # 表格数据的特殊验证
             questions_doc_hits = validate_tables(
                 all_passages,
                 question_answers,
@@ -625,6 +686,7 @@ def main(cfg: DictConfig):
             )
 
         else:
+            # 普通文档的验证
             questions_doc_hits = validate(
                 all_passages,
                 question_answers,
@@ -634,6 +696,7 @@ def main(cfg: DictConfig):
             )
 
         if cfg.out_file:
+            # 保存检索结果到文件
             save_results(
                 all_passages,
                 questions_text if questions_text else questions,
